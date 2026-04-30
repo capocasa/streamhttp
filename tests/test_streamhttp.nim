@@ -256,6 +256,63 @@ suite "StreamConn end-to-end (plain TCP)":
     # final line has no trailing \n, but readLine still returns it on EOF
     check got == @["alpha", "beta", "gamma"]
 
+  test "keep-alive: same conn handles back-to-back requests":
+    # Server stays open between two responses; we send two requests on
+    # one StreamConn. Without the per-response state reset in
+    # `readResponseHead`, the second body would short-circuit because
+    # the first body's `bodyDone` is still set.
+    let resp1 =
+      "HTTP/1.1 200 OK\r\n" &
+      "Content-Length: 5\r\n" &
+      "\r\n" &
+      "first"
+    let resp2 =
+      "HTTP/1.1 200 OK\r\n" &
+      "Transfer-Encoding: chunked\r\n" &
+      "\r\n" &
+      "6\r\nsecond\r\n" &
+      "0\r\n\r\n"
+    type KaArgs = tuple[listener: Socket, r1, r2: string]
+    proc kaThread(a: KaArgs) {.thread, gcsafe.} =
+      {.cast(gcsafe).}:
+        try:
+          var client: Socket
+          a.listener.accept(client)
+          for response in [a.r1, a.r2]:
+            var got = ""
+            while not got.contains("\r\n\r\n"):
+              let chunk = try: client.recv(512) except CatchableError: ""
+              if chunk.len == 0: break
+              got.add chunk
+            client.send(response)
+          client.close()
+        except CatchableError as e:
+          stderr.writeLine "ka server: ", e.msg
+        try: a.listener.close() except CatchableError: discard
+    var th: Thread[KaArgs]
+    let listener = newSocket(buffered = false)
+    listener.setSockOpt(OptReuseAddr, true)
+    listener.bindAddr(Port(0))
+    listener.listen()
+    let (_, port) = listener.getLocalAddr()
+    createThread(th, kaThread, (listener, resp1, resp2))
+    defer: joinThread(th)
+    let c = connectPlain("127.0.0.1", port)
+    defer: c.close()
+    c.sendRequest("GET", "/one", "127.0.0.1")
+    let r1 = c.readResponseHead()
+    check r1.status == 200
+    var line = ""
+    var got1: seq[string]
+    while c.readLine(line): got1.add line
+    check got1 == @["first"]
+    c.sendRequest("GET", "/two", "127.0.0.1")
+    let r2 = c.readResponseHead()
+    check r2.status == 200
+    var got2: seq[string]
+    while c.readLine(line): got2.add line
+    check got2 == @["second"]
+
   test "non-2xx status surfaces":
     let canned =
       "HTTP/1.1 429 Too Many Requests\r\n" &

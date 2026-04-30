@@ -233,7 +233,13 @@ proc sendRequest*(c: StreamConn;
 proc readResponseHead*(c: StreamConn): StreamResponse =
   ## Read status line + headers. Configures the body decoder based on
   ## `Transfer-Encoding` / `Content-Length`. Subsequent `readLine` calls
-  ## yield body lines.
+  ## yield body lines. Resets per-response state (`bodyDone`, `lineBuf`)
+  ## so the same `StreamConn` can be reused for back-to-back requests
+  ## over a keep-alive connection — without this, a second response on
+  ## the same conn would short-circuit `readLine` immediately because
+  ## the previous body's `bodyDone` is still set.
+  c.bodyDone = false
+  c.lineBuf.setLen 0
   let statusLine = c.readHeadLine()
   let parts = statusLine.split(' ', 2)
   if parts.len < 2:

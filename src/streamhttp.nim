@@ -13,7 +13,7 @@
 ## doesn't already give us — the value is in the chunked-decoding
 ## state machine and the line-buffered API on top.
 
-import std/[net, parseutils, strutils, tables]
+import std/[nativesockets, net, parseutils, strutils, tables]
 
 type
   BodyEncoding* = enum
@@ -317,6 +317,13 @@ iterator lines*(c: StreamConn): string =
   var line = ""
   while c.readLine(line):
     yield line
+
+proc getFd*(c: StreamConn): SocketHandle =
+  ## Underlying socket fd. Exposed so callers can `posix.shutdown` it
+  ## from a signal handler / watcher thread to interrupt a blocking
+  ## `recv`. Returns `osInvalidSocket` after `close`.
+  if c.closed: osInvalidSocket
+  else: c.sock.getFd
 
 proc close*(c: StreamConn) =
   ## Close the underlying socket. Idempotent.

@@ -45,6 +45,7 @@ type
 
   StreamConn* = ref object
     sock: Socket
+    readTimeoutMs*: int  ## >0: recv aborts after this many ms idle, raising StreamTimeoutError
     ctx: SslContext              ## kept alive for the connection's lifetime
     decoder: BodyDecoder
     headBuf: string              ## bytes pulled while reading head, may overlap into body
@@ -53,6 +54,13 @@ type
     closed: bool
 
 # ---------- BodyDecoder (pure, testable) ----------
+
+type
+  StreamTimeoutError* = object of CatchableError
+    ## Raised by `readLine`/`recvIntoHead` when `readTimeoutMs` elapses with no
+    ## data. Distinct from EOF so callers can distinguish a transient stall
+    ## from a closed connection.
+    ## Distinguish from EOF: the caller may retry after checking liveness.
 
 proc initBodyDecoder*(encoding: BodyEncoding;
                       contentLength: int = -1): BodyDecoder =
@@ -162,7 +170,16 @@ proc decode*(d: var BodyDecoder; outBuf: var string): DecodeResult =
 const RecvSize = 4096
 
 proc recvIntoHead(c: StreamConn): bool =
-  let chunk = try: c.sock.recv(RecvSize) except CatchableError: ""
+  var chunk = ""
+  var timedOut = false
+  try:
+    chunk = if c.readTimeoutMs > 0: c.sock.recv(RecvSize, c.readTimeoutMs)
+            else: c.sock.recv(RecvSize)
+  except TimeoutError:
+    timedOut = true
+  except CatchableError:
+    chunk = ""
+  if timedOut: raise newException(StreamTimeoutError, "recv timed out")
   if chunk.len == 0: return false
   c.headBuf.add chunk
   true
@@ -299,7 +316,16 @@ proc readLine*(c: StreamConn; line: var string): bool =
       c.lineBuf.add bodyChunk
       c.bodyDone = true
     of drNeedMore:
-      let raw = try: c.sock.recv(RecvSize) except CatchableError: ""
+      var raw = ""
+      var timedOut = false
+      try:
+        raw = if c.readTimeoutMs > 0: c.sock.recv(RecvSize, c.readTimeoutMs)
+              else: c.sock.recv(RecvSize)
+      except TimeoutError:
+        timedOut = true
+      except CatchableError:
+        raw = ""
+      if timedOut: raise newException(StreamTimeoutError, "recv timed out")
       if raw.len == 0:
         c.decoder.markEof()
         var tail = ""

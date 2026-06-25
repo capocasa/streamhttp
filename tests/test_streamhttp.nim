@@ -1,4 +1,4 @@
-import std/[net, strutils, tables, unittest]
+import std/[net, os, strutils, tables, unittest]
 import streamhttp
 
 # ---------- BodyDecoder unit tests ----------
@@ -332,3 +332,70 @@ suite "StreamConn end-to-end (plain TCP)":
     check c.readLine(line) == true
     check line == "limit"
     check c.readLine(line) == false
+
+# ---------- Fragmented-delivery regression ----------
+#
+# The streaming-truncation bug was an OpenSSL internal-buffering issue that
+# only manifests over real TLS (`net.recv(size, timeout)` mishandles
+# `SSL_pending` bytes; see the note in streamhttp.nim). A plain-socket unit
+# test cannot reproduce the TLS-internal part. What it CAN guard is the
+# read-loop structure that replaced the broken `recv(size, timeout)` path:
+# `recvChunk` must correctly re-assemble a body that arrives in many small
+# fragments separated by delays, never declaring EOF early and never dropping
+# a fragment. If a future change reintroduces a "0-byte recv = EOF" guess
+# between fragments, this test fails.
+#
+# The server below sends each SSE chunk as its own `send` with a 15ms gap,
+# so the client's `recvChunk` polls, reads one fragment, loops, polls again,
+# etc. — exactly the cadence that exposed the original truncation.
+
+type FragArgs = object
+  listener: Socket
+
+proc fragServer(args: FragArgs) {.thread, gcsafe.} =
+  {.cast(gcsafe).}:
+    try:
+      var client: Socket
+      args.listener.accept(client)
+      # Send the head, then drip the chunked body one chunk per send with a
+      # delay between each, so the recv loop has to poll repeatedly.
+      client.send("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+      sleep 15
+      for i in 1..12:
+        let body = "data: line" & $i & "\n\n"
+        client.send(toHex(body.len, 2) & "\r\n" & body & "\r\n")
+        sleep 15
+      client.send("0\r\n\r\n")
+      client.close()
+    except CatchableError as e:
+      stderr.writeLine "frag server: ", e.msg
+    try: args.listener.close() except CatchableError: discard
+
+suite "StreamConn fragmented-delivery regression":
+  test "drip-fed chunked body reassembles with no truncation (poll path)":
+    var fragTh: Thread[FragArgs]
+    let listener = newSocket(buffered = false)
+    listener.setSockOpt(OptReuseAddr, true)
+    listener.bindAddr(Port(0))
+    listener.listen()
+    let (_, port) = listener.getLocalAddr()
+    createThread(fragTh, fragServer, FragArgs(listener: listener))
+    defer: joinThread(fragTh)
+    let c = connectPlain("127.0.0.1", port)
+    defer: c.close()
+    # A short readTimeoutMs forces recvChunk through the pollReadable path
+    # (the path the fix rewrote) instead of the plain blocking branch.
+    c.readTimeoutMs = 2000
+    c.sendRequest("POST", "/", "127.0.0.1", body = "{}")
+    let resp = c.readResponseHead()
+    check resp.status == 200
+    var got: seq[string]
+    var line = ""
+    while c.readLine(line):
+      got.add line
+    # Body decodes to 12 SSE lines, each "data: lineN" followed by a blank.
+    check got.len == 24
+    check got[0] == "data: line1"
+    check got[1] == ""
+    check got[22] == "data: line12"
+    check got[23] == ""

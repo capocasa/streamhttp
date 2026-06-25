@@ -14,6 +14,10 @@
 ## state machine and the line-buffered API on top.
 
 import std/[nativesockets, net, parseutils, strutils, tables]
+when defined(posix) and not defined(windows):
+  import std/posix except SocketHandle
+when defined(ssl):
+  import std/openssl
 
 type
   BodyEncoding* = enum
@@ -169,17 +173,112 @@ proc decode*(d: var BodyDecoder; outBuf: var string): DecodeResult =
 
 const RecvSize = 4096
 
+const streamDebug {.booldefine.} = false
+
+template sdbg*(msg: string) =
+  when streamDebug:
+    stderr.writeLine("[sdbg] " & msg)
+
+# ---------- Correct TLS read path ----------
+#
+# Why we don't use `net.recv(size, timeout)` for TLS sockets:
+#
+# Nim's `recv(socket, data, size, timeout)` loops calling `waitFor`, which
+# checks `SSL_pending()` and then calls `select()`/`poll()` on the *raw* fd.
+# For SSL this ordering is wrong: `select` on the raw fd does not understand
+# OpenSSL's internal record buffer. A single `SSL_read` can pull several TLS
+# records off one TCP segment into OpenSSL's plaintext buffer; `select` then
+# reports the fd *not* readable (the bytes were already consumed from the
+# kernel), so the loop's next `waitFor` either times out or, worse, sees a
+# TCP FIN and declares EOF — while `SSL_pending` bytes sit undecoded. The
+# result: streamed responses truncate after the first recv batch. Real-world
+# symptom (z.ai GLM over TLS): the whole SSE body cut to ~500 bytes, or the
+# very first head read returning 0.
+#
+# The correct SSL read pattern, used here, is:
+#   1. If `SSL_pending() > 0`, OpenSSL has decrypted bytes buffered from a
+#      previous read — call `SSL_read` directly, no `poll`. This is the case
+#      that `net`'s loop mishandles.
+#   2. Otherwise `poll()` the raw fd for the timeout. On timeout, raise
+#      `StreamTimeoutError` so the caller can re-check its interrupt/quiet
+#      flags. When `poll` reports readable, call the *blocking* low-level
+#      `recv` (a single `SSL_read`) exactly once — data is guaranteed ready,
+#      so it won't stall, and one `SSL_read` pulls exactly the records
+#      OpenSSL needs rather than re-polling mid-record.
+#
+# Plain (non-TLS) sockets have no internal buffer, so `poll()` + blocking
+# `recv` is also correct for them. When `readTimeoutMs <= 0` we skip `poll`
+# and just block, matching the old behaviour and keeping the plain-HTTP test
+# server path unchanged.
+
+proc sslPendingBytes(c: StreamConn): int {.inline.} =
+  when defined(ssl):
+    if c.sock.isSsl: result = SSL_pending(c.sock.sslHandle).int
+  else: result = 0
+
+proc pollReadable(c: StreamConn): bool =
+  ## Block up to `readTimeoutMs` for the socket to be readable. Returns true
+  ## if data is available, false on timeout. Callers raise `StreamTimeoutError`
+  ## when this returns false and a timeout is in effect.
+  when defined(posix) and not defined(windows):
+    var pfd: posix.TPollfd
+    pfd.fd = cast[cint](c.sock.getFd)
+    pfd.events = posix.POLLIN or posix.POLLPRI
+    # Retry on EINTR (signal interrupted poll) so a stray signal during the
+    # bounded wait doesn't masquerade as a hard timeout. A few retries is
+    # enough — EINTR storms don't happen in practice.
+    var n = -1
+    for _ in 0 ..< 8:
+      n = posix.poll(addr pfd, posix.Tnfds(1), c.readTimeoutMs.cint)
+      if n >= 0: break
+    # n == 0 → timed out; n > 0 → readable; n < 0 → persistent error, treat
+    # as not-ready and let the caller's recv surface it (becomes empty/EOF).
+    result = n > 0 and (pfd.revents and (posix.POLLIN or posix.POLLPRI)) != 0
+  else:
+    # Windows: fall back to `net`'s select wrapper. Plain sockets only on
+    # Windows in practice; the TLS truncation this fixes is POSIX OpenSSL.
+    var fds = @[c.sock]
+    result = selectRead(fds, c.readTimeoutMs) == 1
+
+proc recvChunk(c: StreamConn): string =
+  ## Pull one batch of body/head bytes from the socket. Empty string = clean
+  ## EOF (peer closed). Raises `StreamTimeoutError` when `readTimeoutMs`
+  ## elapses with no data. Correctly drains OpenSSL's internal buffer for TLS
+  ## sockets — see the note above on why `net.recv(size, timeout)` is wrong.
+  if c.readTimeoutMs <= 0:
+    # No timeout requested: plain blocking read. Correct for both TLS and
+    # plain sockets; the SSL loop bug only appears in `net`'s *timeout* path.
+    result = c.sock.recv(RecvSize)
+    sdbg "recvChunk(blocking) got " & $result.len & " bytes"
+    return
+  # Fast path: OpenSSL has decrypted bytes sitting in its internal buffer from
+  # a previous SSL_read. `poll()` would NOT report the fd readable for these
+  # (they're already off the kernel socket), so we must drain them directly.
+  # This single branch is the difference between a complete stream and a
+  # 500-byte truncation over TLS.
+  if sslPendingBytes(c) > 0:
+    result = c.sock.recv(RecvSize)
+    sdbg "recvChunk(sslPending) got " & $result.len & " bytes"
+    return
+  # Wait for the fd to be readable, bounded by the timeout.
+  if not c.pollReadable():
+    raise newException(StreamTimeoutError, "recv timed out")
+  # poll said readable — but on TLS the readability may be a close_notify or
+  # a renegotiation handshake rather than app data. A blocking recv here does
+  # a single SSL_read; if it yields 0 the peer genuinely closed (after the
+  # SSL_pending drain above already took everything that was buffered).
+  result = c.sock.recv(RecvSize)
+  sdbg "recvChunk(poll) got " & $result.len & " bytes"
+
 proc recvIntoHead(c: StreamConn): bool =
   var chunk = ""
-  var timedOut = false
   try:
-    chunk = if c.readTimeoutMs > 0: c.sock.recv(RecvSize, c.readTimeoutMs)
-            else: c.sock.recv(RecvSize)
-  except TimeoutError:
-    timedOut = true
-  except CatchableError:
+    chunk = c.recvChunk()
+  except StreamTimeoutError:
+    raise
+  except CatchableError as e:
+    sdbg "recvIntoHead exception: " & e.msg
     chunk = ""
-  if timedOut: raise newException(StreamTimeoutError, "recv timed out")
   if chunk.len == 0: return false
   c.headBuf.add chunk
   true
@@ -204,15 +303,37 @@ proc newStreamConn*(sock: Socket; ctx: SslContext = nil): StreamConn =
   ## the SslContext while the socket is still in use crashes openssl.
   StreamConn(sock: sock, ctx: ctx)
 
+proc isIpAddress(s: string): bool =
+  ## Crude IPv4/IPv6 check so we skip SNI for raw-IP hosts (TLS forbids SNI
+  ## for literal addresses; some servers reject the extension there).
+  if s.len == 0: return false
+  var dots = 0
+  for ch in s:
+    if ch == '.': inc dots
+    elif ch == ':': return true   # looks like IPv6
+    elif ch notin {'0'..'9'}: return false
+  dots == 3
+
 proc connectTls*(host: string; port: Port = Port(443);
                  timeoutMs: int = 20_000;
                  caFile: string = ""): StreamConn =
   ## Open a TLS connection. `caFile` is an optional CA bundle (skip
   ## scanning system locations when set). Returns a `StreamConn` ready
   ## for `sendRequest`.
+  ##
+  ## Sets SNI (Server Name Indication) from `host` when it is a hostname,
+  ## not a literal IP. SNI is standard practice for TLS to a named host:
+  ## most modern edges and CDNs use it to pick the certificate/vhost, and a
+  ## few will reject or mis-route a ClientHello that omits it. It is set
+  ## before the handshake via `SSL_set_tlsext_host_name`.
   let ctx = newContext(verifyMode = CVerifyPeer, caFile = caFile)
   var sock = newSocket(buffered = false)
   ctx.wrapSocket(sock)
+  when defined(ssl):
+    if not isIpAddress(host):
+      # Must be called before the handshake. A no-op on OpenSSL builds
+      # without TLSEXT, hence `discard`.
+      discard SSL_set_tlsext_host_name(sock.sslHandle, host)
   sock.connect(host, port, timeout = timeoutMs)
   newStreamConn(sock, ctx)
 
@@ -317,15 +438,14 @@ proc readLine*(c: StreamConn; line: var string): bool =
       c.bodyDone = true
     of drNeedMore:
       var raw = ""
-      var timedOut = false
       try:
-        raw = if c.readTimeoutMs > 0: c.sock.recv(RecvSize, c.readTimeoutMs)
-              else: c.sock.recv(RecvSize)
-      except TimeoutError:
-        timedOut = true
-      except CatchableError:
+        raw = c.recvChunk()
+      except StreamTimeoutError:
+        raise
+      except CatchableError as e:
+        sdbg "readLine recv exception: " & e.msg
         raw = ""
-      if timedOut: raise newException(StreamTimeoutError, "recv timed out")
+      sdbg "readLine recv got " & $raw.len & " bytes, lineBuf=" & $c.lineBuf.len
       if raw.len == 0:
         c.decoder.markEof()
         var tail = ""

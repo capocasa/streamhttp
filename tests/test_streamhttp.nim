@@ -399,3 +399,53 @@ suite "StreamConn fragmented-delivery regression":
     check got[1] == ""
     check got[22] == "data: line12"
     check got[23] == ""
+
+# ---------- Bounded-read timeout regression ----------
+#
+# `pollReadable` is the Windows/POSIX branch that gates every timed recv.
+# A regression there — wrong select/poll arg, inverted return — either
+# hangs forever or raises immediately. This drives the timeout-return
+# path concretely: a server that accepts, sends the head, then goes
+# silent. With readTimeoutMs set, recvChunk must raise StreamTimeoutError
+# within the bound instead of blocking.
+
+type TimeoutArgs = object
+  listener: Socket
+
+proc timeoutServer(args: TimeoutArgs) {.thread, gcsafe.} =
+  {.cast(gcsafe).}:
+    try:
+      var client: Socket
+      args.listener.accept(client)
+      # Send a complete head, then hold the socket open without sending
+      # any body bytes. The client blocks waiting for body data.
+      client.send("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+      sleep 3000
+      client.close()
+    except CatchableError as e:
+      stderr.writeLine "timeout server: ", e.msg
+    try: args.listener.close() except CatchableError: discard
+
+suite "StreamConn bounded-read timeout":
+  test "idle recv raises StreamTimeoutError within readTimeoutMs":
+    var th: Thread[TimeoutArgs]
+    let listener = newSocket(buffered = false)
+    listener.setSockOpt(OptReuseAddr, true)
+    listener.bindAddr(Port(0))
+    listener.listen()
+    let (_, port) = listener.getLocalAddr()
+    createThread(th, timeoutServer, TimeoutArgs(listener: listener))
+    defer: joinThread(th)
+    let c = connectPlain("127.0.0.1", port)
+    defer: c.close()
+    c.readTimeoutMs = 200
+    c.sendRequest("POST", "/", "127.0.0.1", body = "{}")
+    let resp = c.readResponseHead()
+    check resp.status == 200
+    var raised = false
+    var line = ""
+    try:
+      discard c.readLine(line)
+    except StreamTimeoutError:
+      raised = true
+    check raised

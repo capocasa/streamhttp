@@ -235,9 +235,10 @@ proc pollReadable(c: StreamConn): bool =
     # as not-ready and let the caller's recv surface it (becomes empty/EOF).
     result = n > 0 and (pfd.revents and (posix.POLLIN or posix.POLLPRI)) != 0
   else:
-    # Windows: fall back to `net`'s select wrapper. Plain sockets only on
-    # Windows in practice; the TLS truncation this fixes is POSIX OpenSSL.
-    var fds = @[c.sock]
+    # Windows: `selectRead` wants `seq[SocketHandle]`, not `seq[Socket]`.
+    # Plain sockets only on Windows in practice; the TLS truncation this
+    # fixes is POSIX OpenSSL.
+    var fds = @[c.sock.getFd]
     result = selectRead(fds, c.readTimeoutMs) == 1
 
 proc recvChunk(c: StreamConn): string =

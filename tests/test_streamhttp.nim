@@ -449,3 +449,44 @@ suite "StreamConn bounded-read timeout":
     except StreamTimeoutError:
       raised = true
     check raised
+
+  test "setReadTimeoutMs bounds a blocking recv that poll reports readable":
+    # Regression for the waitforever bug: poll() can report the fd readable
+    # (because head bytes are queued) while the subsequent blocking recv has
+    # no kernel deadline and stalls indefinitely. `setReadTimeoutMs` must set
+    # SO_RCVTIMEO so the kernel surfaces EAGAIN, which doRecv promotes to
+    # StreamTimeoutError. Plain-field assignment (readTimeoutMs=) does NOT
+    # set SO_RCVTIMEO, so this test guards that the setter is the required
+    # path. A server that sends the head then holds the body forces recv into
+    # the unbounded-after-poll window; without SO_RCVTIMEO this hangs.
+    proc partialServer(listener: Socket) {.thread, gcsafe.} =
+      {.cast(gcsafe).}:
+        try:
+          var client: Socket
+          listener.accept(client)
+          client.send("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+          sleep 8000
+          client.close()
+        except CatchableError: discard
+        try: listener.close() except CatchableError: discard
+    var th: Thread[Socket]
+    let listener = newSocket(buffered = false)
+    listener.setSockOpt(OptReuseAddr, true)
+    listener.bindAddr(Port(0))
+    listener.listen()
+    let (_, port) = listener.getLocalAddr()
+    createThread(th, partialServer, listener)
+    defer: joinThread(th)
+    let c = connectPlain("127.0.0.1", port)
+    defer: c.close()
+    c.setReadTimeoutMs(300)
+    c.sendRequest("POST", "/", "127.0.0.1", body = "{}")
+    let resp = c.readResponseHead()
+    check resp.status == 200
+    var raised = false
+    var line = ""
+    try:
+      discard c.readLine(line)
+    except StreamTimeoutError:
+      raised = true
+    check raised

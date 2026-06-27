@@ -47,7 +47,7 @@ type
     statusText*: string
     headers*: Table[string, string]   ## keys lowercased
 
-  StreamConn* = ref object
+  StreamConnObj = object
     sock: Socket
     readTimeoutMs*: int  ## >0: recv aborts after this many ms idle, raising StreamTimeoutError
     ctx: SslContext              ## kept alive for the connection's lifetime
@@ -56,6 +56,12 @@ type
     lineBuf: string              ## decoded body bytes pending line split
     bodyDone: bool               ## decoder hit end-of-body
     closed: bool
+  StreamConn* = ref StreamConnObj
+  ## `readTimeoutMs` is exported but must be assigned via `setReadTimeoutMs`
+  ## so the per-read deadline is mirrored onto the kernel socket as
+  ## `SO_RCVTIMEO`. A plain field assignment would leave `SSL_read`/`recv`
+  ## without a hard deadline and the timeout would only bound the `poll`
+  ## step, not the blocking read that follows it.
 
 # ---------- BodyDecoder (pure, testable) ----------
 
@@ -179,6 +185,34 @@ template sdbg*(msg: string) =
   when streamDebug:
     stderr.writeLine("[sdbg] " & msg)
 
+proc applyRecvTimeout*(sock: Socket; timeoutMs: int) =
+  ## Set `SO_RCVTIMEO` on the underlying socket fd so a blocking `recv` (and,
+  ## on TLS, the `SSL_read` it drives) is woken by the kernel after
+  ## `timeoutMs` of inactivity. Without this, `poll()`-then-`recv` has a
+  ## race window: `poll` can report the fd readable for a TLS record that
+  ## OpenSSL consumes internally (a `close_notify` alert, a `NewSessionTicket`,
+  ## or a renegotiation handshake) and then blocks in `SSL_read` waiting for
+  ## the next application-data record. `poll` is immune to that record type,
+  ## so the bounded `poll` step returns but the unbounded `SSL_read` after it
+  ## stalls. `SO_RCVTIMEO` makes the kernel interrupt the stall and surface
+  ## `EAGAIN`, which `net.recv` raises as `OSError`; `recvChunk` translates
+  ## that to `StreamTimeoutError` so the caller's wake loop fires. A no-op
+  ## (and safe) on Windows, which we don't ship TLS on.
+  if timeoutMs <= 0: return
+  when defined(posix) and not defined(windows):
+    var tv: Timeval
+    tv.tv_sec = Time(timeoutMs div 1000)
+    tv.tv_usec = Suseconds((timeoutMs mod 1000) * 1000)
+    discard setsockopt(sock.getFd, SOL_SOCKET, SO_RCVTIMEO,
+                       addr(tv), sizeof(tv).SockLen)
+
+proc setReadTimeoutMs*(c: StreamConn; timeoutMs: int) =
+  ## Assign `readTimeoutMs` and mirror it onto the kernel socket as
+  ## `SO_RCVTIMEO`. This is the only correct way to change the per-read
+  ## deadline after construction.
+  c.readTimeoutMs = timeoutMs
+  applyRecvTimeout(c.sock, timeoutMs)
+
 # ---------- Correct TLS read path ----------
 #
 # Why we don't use `net.recv(size, timeout)` for TLS sockets:
@@ -202,9 +236,17 @@ template sdbg*(msg: string) =
 #   2. Otherwise `poll()` the raw fd for the timeout. On timeout, raise
 #      `StreamTimeoutError` so the caller can re-check its interrupt/quiet
 #      flags. When `poll` reports readable, call the *blocking* low-level
-#      `recv` (a single `SSL_read`) exactly once — data is guaranteed ready,
-#      so it won't stall, and one `SSL_read` pulls exactly the records
-#      OpenSSL needs rather than re-polling mid-record.
+#      `recv` (a single `SSL_read`) exactly once — one `SSL_read` pulls
+#      exactly the records OpenSSL needs rather than re-polling mid-record.
+#      NOTE: `poll` reporting readable does NOT guarantee `SSL_read` returns
+#      promptly: the readable edge may be a `close_notify` alert, a
+#      `NewSessionTicket`, or a renegotiation handshake that OpenSSL
+#      consumes internally and then blocks waiting for the next
+#      application-data record. To bound that stall, `setReadTimeoutMs`
+#      sets `SO_RCVTIMEO` on the kernel socket so the blocked read is woken
+#      with `EAGAIN`, which `doRecv` promotes to `StreamTimeoutError`. A
+#      plain `readTimeoutMs=` field assignment does NOT set `SO_RCVTIMEO`,
+#      so it leaves a path that hangs forever under a quiet-network spinner.
 #
 # Plain (non-TLS) sockets have no internal buffer, so `poll()` + blocking
 # `recv` is also correct for them. When `readTimeoutMs <= 0` we skip `poll`
@@ -241,6 +283,26 @@ proc pollReadable(c: StreamConn): bool =
     var fds = @[c.sock.getFd]
     result = selectRead(fds, c.readTimeoutMs) == 1
 
+proc doRecv(c: StreamConn): string =
+  ## One blocking `recv`/`SSL_read` on the underlying socket. With
+  ## `SO_RCVTIMEO` applied by `setReadTimeoutMs`, the kernel wakes a stalled
+  ## read with `EAGAIN`, which `net.recv` raises as `OSError`; translate that
+  ## to `StreamTimeoutError` so the caller's wake loop fires. Other errors
+  ## propagate so the caller can distinguish them from a clean EOF.
+  try:
+    result = c.sock.recv(RecvSize)
+  except OSError as e:
+    # `SO_RCVTIMEO` expiry surfaces as EAGAIN/EWOULDBLOCK on POSIX. The
+    # quiet/interrupt wake loops key off `StreamTimeoutError`, so promote it.
+    # Use the exception's stored `errorCode` (captured at raise time) rather
+    # than re-reading `errno`, which another syscall may have clobbered. A
+    # genuine socket error (peer reset etc.) carries a different errno and
+    # re-raises here so the caller surfaces it as a hard error.
+    when defined(posix) and not defined(windows):
+      if e.errorCode == EAGAIN.int32 or e.errorCode == EWOULDBLOCK.int32:
+        raise newException(StreamTimeoutError, "recv timed out (SO_RCVTIMEO)")
+    raise e
+
 proc recvChunk(c: StreamConn): string =
   ## Pull one batch of body/head bytes from the socket. Empty string = clean
   ## EOF (peer closed). Raises `StreamTimeoutError` when `readTimeoutMs`
@@ -258,7 +320,7 @@ proc recvChunk(c: StreamConn): string =
   # This single branch is the difference between a complete stream and a
   # 500-byte truncation over TLS.
   if sslPendingBytes(c) > 0:
-    result = c.sock.recv(RecvSize)
+    result = c.doRecv()
     sdbg "recvChunk(sslPending) got " & $result.len & " bytes"
     return
   # Wait for the fd to be readable, bounded by the timeout.
@@ -267,8 +329,12 @@ proc recvChunk(c: StreamConn): string =
   # poll said readable — but on TLS the readability may be a close_notify or
   # a renegotiation handshake rather than app data. A blocking recv here does
   # a single SSL_read; if it yields 0 the peer genuinely closed (after the
-  # SSL_pending drain above already took everything that was buffered).
-  result = c.sock.recv(RecvSize)
+  # SSL_pending drain above already took everything that was buffered). The
+  # `SO_RCVTIMEO` set by `setReadTimeoutMs` guarantees this read cannot
+  # outlive `readTimeoutMs` even in that case: the kernel surfaces EAGAIN,
+  # `doRecv` promotes it to `StreamTimeoutError`, and the caller's wake loop
+  # re-checks interrupt/quiet instead of hanging forever under the hourglass.
+  result = c.doRecv()
   sdbg "recvChunk(poll) got " & $result.len & " bytes"
 
 proc recvIntoHead(c: StreamConn): bool =
@@ -278,8 +344,13 @@ proc recvIntoHead(c: StreamConn): bool =
   except StreamTimeoutError:
     raise
   except CatchableError as e:
+    # Don't swallow the error as clean EOF: a transient read failure
+    # (reset, TLS alert, EINTR) would otherwise masquerade as a graceful
+    # connection close, leave `headBuf` half-filled, and let
+    # `readResponseHead` build a truncated/empty response. Re-raise so the
+    # caller's `except CatchableError` surfaces it as a request failure.
     sdbg "recvIntoHead exception: " & e.msg
-    chunk = ""
+    raise e
   if chunk.len == 0: return false
   c.headBuf.add chunk
   true

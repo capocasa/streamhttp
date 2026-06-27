@@ -285,21 +285,40 @@ proc pollReadable(c: StreamConn): bool =
 
 proc doRecv(c: StreamConn): string =
   ## One blocking `recv`/`SSL_read` on the underlying socket. With
-  ## `SO_RCVTIMEO` applied by `setReadTimeoutMs`, the kernel wakes a stalled
-  ## read with `EAGAIN`, which `net.recv` raises as `OSError`; translate that
-  ## to `StreamTimeoutError` so the caller's wake loop fires. Other errors
-  ## propagate so the caller can distinguish them from a clean EOF.
+  ## `SO_RCVTIMEO` applied by `setReadTimeoutMs`, a stalled read is woken by
+  ## the kernel and promoted to `StreamTimeoutError` so the caller's wake
+  ## loop fires. Other errors propagate so the caller can distinguish them
+  ## from a clean EOF.
+  ##
+  ## The timeout surfaces differently on plain vs TLS sockets. On a plain
+  ## socket the kernel recv returns EAGAIN, which `net` raises as `OSError`.
+  ## On a TLS socket OpenSSL turns the EAGAIN into `SSL_ERROR_WANT_READ` (or
+  ## WANT_WRITE), which `net.socketError` raises as
+  ## `SslError("Not enough data on socket.")`, not an `OSError`. Both are the
+  ## same condition under our `SO_RCVTIMEO` regime and must map to the same
+  ## `StreamTimeoutError` or the quiet/interrupt wake loop never fires and a
+  ## slow-but-healthy provider (z.ai GLM, ~7s to first byte) is reported as
+  ## `request failed: Not enough data on socket.`.
   try:
     result = c.sock.recv(RecvSize)
   except OSError as e:
-    # `SO_RCVTIMEO` expiry surfaces as EAGAIN/EWOULDBLOCK on POSIX. The
-    # quiet/interrupt wake loops key off `StreamTimeoutError`, so promote it.
     # Use the exception's stored `errorCode` (captured at raise time) rather
     # than re-reading `errno`, which another syscall may have clobbered. A
     # genuine socket error (peer reset etc.) carries a different errno and
     # re-raises here so the caller surfaces it as a hard error.
     when defined(posix) and not defined(windows):
       if e.errorCode == EAGAIN.int32 or e.errorCode == EWOULDBLOCK.int32:
+        raise newException(StreamTimeoutError, "recv timed out (SO_RCVTIMEO)")
+    raise e
+  except CatchableError as e:
+    when defined(ssl):
+      # TLS counterpart of the EAGAIN branch above: `SO_RCVTIMEO` expiry
+      # under SSL_read becomes SSL_ERROR_WANT_READ/WANT_WRITE, raised by
+      # `net` as `SslError("Not enough data on socket.")`. Match that exact
+      # message and promote it; any other `SslError` (alert, handshake
+      # failure) is a real fault and re-raises.
+      if e of SslError and
+          "Not enough data on socket" in e.msg:
         raise newException(StreamTimeoutError, "recv timed out (SO_RCVTIMEO)")
     raise e
 

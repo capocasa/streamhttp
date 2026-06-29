@@ -13,7 +13,7 @@
 ## doesn't already give us — the value is in the chunked-decoding
 ## state machine and the line-buffered API on top.
 
-import std/[nativesockets, net, parseutils, strutils, tables]
+import std/[nativesockets, net, os, parseutils, strutils, tables]
 when defined(posix) and not defined(windows):
   import std/posix except SocketHandle
 when defined(ssl):
@@ -436,6 +436,46 @@ proc connectPlain*(host: string; port: Port;
   sock.connect(host, port, timeout = timeoutMs)
   newStreamConn(sock)
 
+proc sslSendAll(sock: Socket; data: string) =
+  ## Write all of `data` to a TLS socket, aborting on a dead connection
+  ## instead of busy-looping.
+  ##
+  ## Why this exists: `net.send`'s retry loop treats an `SSL_write` return
+  ## of 0 as "0 bytes written, try again" and never advances its offset,
+  ## so a half-closed keep-alive connection (the server timed out the idle
+  ## socket and half-closed it) makes it spin on `SSL_write` at 100% CPU
+  ## forever. `SSL_write` returns <= 0 to mean "not progress, query
+  ## SSL_get_error": only WANT_READ/WANT_WRITE are retryable transient
+  ## states, and even those need a bound or they loop just as hard on a
+  ## truly dead socket. Anything else (ZERO_RETURN on a peer close_notify,
+  ## SYSCALL, SSL) is a hard failure we surface as a raise so the caller
+  ## drops the cached connection and reconnects.
+  when defined(ssl):
+    doAssert sock.isSsl
+    var written = 0
+    var idle = 0            # consecutive non-progressing iterations
+    const MaxIdle = 50      # ~5s of WANT_READ/WANT_WRITE spin before giving up
+    while written < data.len:
+      ErrClearError()
+      let n = SSL_write(sock.sslHandle,
+                       cast[cstring](cast[uint](cstring(data)) + uint(written)),
+                       data.len - written)
+      if n > 0:
+        written.inc n.int
+        idle = 0
+        continue
+      let err = SSL_get_error(sock.sslHandle, n)
+      if err == SSL_ERROR_WANT_READ.cint or err == SSL_ERROR_WANT_WRITE.cint:
+        inc idle
+        if idle > MaxIdle:
+          raise newException(IOError, "TLS write stalled: peer not accepting data")
+        sleep(100)
+        continue
+      # ZERO_RETURN (peer sent close_notify), SYSCALL, or a real SSL error.
+      raise newException(IOError, "TLS connection closed during write")
+  else:
+    sock.send(data)
+
 proc sendRequest*(c: StreamConn;
                   httpMethod: string;
                   path: string;
@@ -457,7 +497,13 @@ proc sendRequest*(c: StreamConn;
   req.add "\r\n"
   if body.len > 0:
     req.add body
-  c.sock.send(req)
+  when defined(ssl):
+    if c.sock.isSsl:
+      c.sock.sslSendAll(req)
+    else:
+      c.sock.send(req)
+  else:
+    c.sock.send(req)
 
 proc readResponseHead*(c: StreamConn): StreamResponse =
   ## Read status line + headers. Configures the body decoder based on

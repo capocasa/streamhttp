@@ -1,0 +1,43 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+
+    # git-bash on the Windows runner. The Windows default (pwsh) does not
+    # propagate non-zero exit codes from native exes like nimble, so a
+    # failing test would be swallowed and the job would report green. Same
+    # workaround as 3code's windows workflow. The dev tools (`openssl` for
+    # test_send_dead_tls) come pre-installed on the windows-latest image.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: stable
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          parent-nim-install-directory: $HOME
+          nim-install-directory: nim-toolchain
+
+      - name: Run tests
+        # Run the same set the `test` nimble task does, but inline so any
+        # non-zero exit code propagates out of git-bash. `set -e` is belt-
+        # and-braces; the explicit `|| exit 1` is the actual fix for the
+        # git-bash exit-code issue.
+        run: |
+          set -e
+          for t in tests/test_streamhttp.nim tests/test_handshake_timeout.nim tests/test_send_dead_tls.nim; do
+            nim c -r "$t" || exit 1
+          done
+        timeout-minutes: 30

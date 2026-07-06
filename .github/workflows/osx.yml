@@ -1,0 +1,42 @@
+name: OSX
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache the Nim toolchain. macOS runners are the slowest of the three
+      # to install Nim from scratch, and the action only refetches on a
+      # cache miss keyed on the .nimble file. Same pattern 3code uses.
+      - name: Restore Nim toolchain cache
+        id: cache-nim
+        uses: actions/cache@v4
+        with:
+          path: /Users/runner/nim-toolchain
+          key: ${{ runner.os }}-${{ runner.arch }}-nim-toolchain-${{ hashFiles('*.nimble') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-nim-toolchain-
+
+      - uses: jiro4989/setup-nim-action@v2
+        if: steps.cache-nim.outputs.cache-hit != 'true'
+        with:
+          nim-version: stable
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          parent-nim-install-directory: $HOME
+          nim-install-directory: nim-toolchain
+
+      - name: Add Nim to PATH on cache hit
+        if: steps.cache-nim.outputs.cache-hit == 'true'
+        run: echo "$HOME/nim-toolchain/bin" >> $GITHUB_PATH
+
+      - name: Run tests
+        run: nimble test
+        timeout-minutes: 20

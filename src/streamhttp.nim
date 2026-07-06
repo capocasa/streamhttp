@@ -15,9 +15,14 @@
 
 import std/[nativesockets, net, os, parseutils, strutils, tables]
 from std/times import epochTime
+import std/locks
+# `std/locks` is portable (wraps `CRITICAL_SECTION` on Windows, `pthread_mutex_t`
+# on POSIX) and the DNS cache below uses `Lock`/`initLock`/`withLock` at module
+# scope on every platform. The import must therefore stay OUTSIDE the
+# `when defined(posix) and not defined(windows):` guard; keeping it inside was
+# the regression that broke `nim c -r --os:windows` in 0.4.0.
 when defined(posix) and not defined(windows):
   import std/posix except SocketHandle
-  import std/locks
 when defined(ssl):
   import std/openssl
 

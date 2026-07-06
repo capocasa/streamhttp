@@ -1,1 +1,6 @@
-tests/test_streamhttp
+# Test binaries (the dev runs the live-API ones with GLM_API_KEY=...). The
+# negation re-includes the .nim sources so the wildcard below doesn't sweep
+# them up. The previous version only listed one file, which let three more
+# sneak in over time.
+tests/test_*
+!tests/test_*.nim

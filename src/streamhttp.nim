@@ -14,8 +14,10 @@
 ## state machine and the line-buffered API on top.
 
 import std/[nativesockets, net, os, parseutils, strutils, tables]
+from std/times import epochTime
 when defined(posix) and not defined(windows):
   import std/posix except SocketHandle
+  import std/locks
 when defined(ssl):
   import std/openssl
 
@@ -70,7 +72,11 @@ type
     ## Raised by `readLine`/`recvIntoHead` when `readTimeoutMs` elapses with no
     ## data. Distinct from EOF so callers can distinguish a transient stall
     ## from a closed connection.
-    ## Distinguish from EOF: the caller may retry after checking liveness.
+  HandshakeTimeoutError* = object of StreamTimeoutError
+    ## Raised by `connectTls` when the TLS handshake (`SSL_connect`) does not
+    ## complete within the connect deadline. A subtype of `StreamTimeoutError`
+    ## so the recv loop's existing `except StreamTimeoutError` recovery in the
+    ## caller treats a handshake stall uniformly with a recv stall.
 
 proc initBodyDecoder*(encoding: BodyEncoding;
                       contentLength: int = -1): BodyDecoder =
@@ -405,6 +411,140 @@ proc isIpAddress(s: string): bool =
     elif ch notin {'0'..'9'}: return false
   dots == 3
 
+# ---------- DNS pre-resolve cache ----------
+#
+# `net.connect(host, port)` calls the libc resolver (`getAddrInfo`) on every
+# connect, with no timeout. On a flaky or black-holed resolver that can hang
+# for tens of seconds or effectively forever, and there is no socket fd yet
+# for the caller's quiet-watch `shutdown(fd)` to interrupt. We remove the
+# resolver from the hot path by resolving each host once, caching the first
+# usable IP for the process lifetime, and connecting by IP. SNI and cert
+# validation still use the original hostname, so TLS identity is unaffected.
+#
+# The single first resolution per host is itself unbounded. Bounding it needs
+# a resolver thread (Tier 2) or c-ares (out of scope); for now one blocking
+# resolve on first use per process is accepted as the documented floor.
+
+var
+  resolveLock: Lock
+  resolveCache {.guard: resolveLock.}: Table[string, string]
+resolveLock.initLock()
+
+template resolveKey(host: string; port: Port): string =
+  host & ":" & $port.uint16
+
+proc resolveOne(host: string; port: Port): string =
+  ## Resolve `host:port` to the first usable IP string via `getAddrInfo`.
+  ## Raises `IOError` on resolution failure (mirrors `net.connect`).
+  let aiList = getAddrInfo(host, port)
+  defer: freeAddrInfo(aiList)
+  var it = aiList
+  while it != nil:
+    try:
+      result = getAddrString(it.ai_addr)
+      if result.len > 0: return
+    except CatchableError:
+      discard
+    it = it.ai_next
+  raise newException(IOError, "Couldn't resolve address: " & host)
+
+proc resolveCached*(host: string; port: Port): string =
+  ## Return a cached IP for `host:port`, resolving on first call. Cache lives
+  ## for the process; `invalidateResolved` clears an entry so the next call
+  ## re-resolves (used after a connect failure, in case the cached record
+  ## points at a dead host). If `host` is already a literal IP, it is returned
+  ## unchanged without touching the cache.
+  if isIpAddress(host): return host
+  let key = resolveKey(host, port)
+  withLock(resolveLock):
+    if resolveCache.hasKey(key):
+      result = resolveCache[key]
+    else:
+      result = resolveOne(host, port)
+      resolveCache[key] = result
+
+proc invalidateResolved*(host: string; port: Port) =
+  ## Drop the cached IP for `host:port` so the next `resolveCached` re-resolves.
+  ## Called after any connect failure so a stale record pointing at a dead
+  ## host doesn't pin every retry.
+  if isIpAddress(host): return
+  let key = resolveKey(host, port)
+  withLock(resolveLock):
+    resolveCache.del(key)
+
+when defined(ssl):
+  proc handshakeBounded(sock: Socket; deadlineMs: int) =
+    ## Drive `SSL_connect` to completion within a wall-clock deadline, using a
+    ## non-blocking socket and `posix.poll` per iteration.
+    ##
+    ## Why this exists: `net.connect(host, port, timeout)` times the TCP
+    ## connect via `timeoutWrite` but then sets the socket blocking and calls
+    ## `SSL_connect` with no timeout. A server that accepts TCP but never
+    ## completes the handshake hangs here indefinitely, and since there is no
+    ## deadline there is no wake-up for the caller's quiet-watch shutdown. We
+    ## split the connect budget between TCP and handshake as a single
+    ## wall-clock budget: the caller passes the remaining milliseconds and we
+    ## refuse to let any `WANT_READ`/`WANT_WRITE` iteration extend it.
+    when defined(posix) and not defined(windows):
+      let fd = sock.getFd
+      fd.setBlocking(false)
+      try:
+        while true:
+          ErrClearError()
+          let n = SSL_connect(sock.sslHandle)
+          if n > 0:
+            return
+          let err = SSL_get_error(sock.sslHandle, n)
+          if err != SSL_ERROR_WANT_READ.cint and err != SSL_ERROR_WANT_WRITE.cint:
+            # Hard failure (ZERO_RETURN, SYSCALL, SSL). Defer to `socketError`
+            # for the canonical SslError/OSError so callers see the real cause.
+            sock.socketError(n)
+            return  # socketError raises; guard for clarity.
+          let nowMs = int(epochTime() * 1000)
+          let remaining = deadlineMs - nowMs
+          if remaining <= 0:
+            raise newException(HandshakeTimeoutError,
+              "TLS handshake timed out")
+          var pfd: posix.TPollfd
+          pfd.fd = cast[cint](fd)
+          pfd.events = if err == SSL_ERROR_WANT_READ.cint:
+            posix.POLLIN or posix.POLLPRI
+          else:
+            posix.POLLOUT or posix.POLLWRBAND
+          # Retry on EINTR so a stray signal doesn't masquerade as a timeout.
+          var pr = cint(-1)
+          for _ in 0 ..< 8:
+            pr = posix.poll(addr pfd, posix.Tnfds(1), remaining.cint)
+            if pr >= 0: break
+          if pr == 0:
+            raise newException(HandshakeTimeoutError,
+              "TLS handshake timed out")
+          if pr < 0:
+            # Persistent poll error; surface via socketError so it raises.
+            sock.socketError(-1)
+      finally:
+        fd.setBlocking(true)
+    else:
+      ErrClearError()
+      let ret = SSL_connect(sock.sslHandle)
+      sock.socketError(ret)
+
+  proc checkCertNameInline(sock: Socket; hostname: string) =
+    ## Validate the peer certificate's SAN/CN against `hostname`, mirroring
+    ## `net.checkCertName` (which is private and so unreachable from here).
+    ## Uses `X509_check_host` with `X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT`, the
+    ## same as the stdlib, so wildcard and SAN matching are identical.
+    when not defined(nimDisableCertificateValidation) and not defined(windows):
+      let certificate = sock.sslHandle.SSL_get_peer_certificate()
+      if certificate.isNil:
+        raiseSSLError("No SSL certificate found.")
+      const X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT = 0x1.cuint
+      let match = certificate.X509_check_host(hostname.cstring, hostname.len.cint,
+        X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT, nil)
+      X509_free(certificate)
+      if match != 1:
+        raiseSSLError("SSL Certificate check failed.")
+
 proc connectTls*(host: string; port: Port = Port(443);
                  timeoutMs: int = 20_000;
                  caFile: string = ""): StreamConn =
@@ -417,23 +557,42 @@ proc connectTls*(host: string; port: Port = Port(443);
   ## most modern edges and CDNs use it to pick the certificate/vhost, and a
   ## few will reject or mis-route a ClientHello that omits it. It is set
   ## before the handshake via `SSL_set_tlsext_host_name`.
+  ##
+  ## DNS: resolves `host` once via `getAddrInfo` (cached per process) and
+  ## connects to the IP, so the libc resolver only runs on the first call per
+  ## host, not on every connect. SNI and cert validation still use `host`.
+  ## `timeoutMs` is a single budget shared by the TCP connect and the TLS
+  ## handshake; either exceeding it raises `HandshakeTimeoutError`
+  ## (a `StreamTimeoutError` subtype).
+  let ip = resolveCached(host, port)
   let ctx = newContext(verifyMode = CVerifyPeer, caFile = caFile)
+  # TCP connect on a plain socket first. We deliberately wrap SSL AFTER the
+  # TCP connect: `net.connect(socket, ip, timeout)` runs a blocking
+  # `SSL_connect` when the socket is already SSL-wrapped, and that call has
+  # no timeout - the hole we are closing. By connecting plain and wrapping
+  # after, the bounded handshake below is the only `SSL_connect` on the path.
   var sock = newSocket(buffered = false)
+  let startMs = int(epochTime() * 1000)
+  sock.connect(ip, port, timeout = timeoutMs)
   ctx.wrapSocket(sock)
   when defined(ssl):
     if not isIpAddress(host):
       # Must be called before the handshake. A no-op on OpenSSL builds
       # without TLSEXT, hence `discard`.
       discard SSL_set_tlsext_host_name(sock.sslHandle, host)
-  sock.connect(host, port, timeout = timeoutMs)
+    handshakeBounded(sock, startMs + timeoutMs)
+    if not isIpAddress(host):
+      sock.checkCertNameInline(host)
   newStreamConn(sock, ctx)
 
 proc connectPlain*(host: string; port: Port;
                    timeoutMs: int = 20_000): StreamConn =
   ## Open a plain (non-TLS) TCP connection. For testing against local
-  ## servers, or http:// endpoints when you don't care about TLS.
+  ## servers, or http:// endpoints when you don't care about TLS. Resolves
+  ## `host` once via `getAddrInfo` (cached per process) and connects to the IP.
+  let ip = resolveCached(host, port)
   var sock = newSocket(buffered = false)
-  sock.connect(host, port, timeout = timeoutMs)
+  sock.connect(ip, port, timeout = timeoutMs)
   newStreamConn(sock)
 
 proc sslSendAll(sock: Socket; data: string) =

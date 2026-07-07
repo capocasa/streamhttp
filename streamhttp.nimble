@@ -1,4 +1,4 @@
-version       = "0.4.1"
+version       = "0.4.2"
 author        = "capocasa"
 description   = "Tiny synchronous streaming HTTP/1.1 client. Reads chunked bodies as they arrive."
 license       = "MIT"

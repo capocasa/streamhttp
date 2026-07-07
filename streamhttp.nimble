@@ -14,4 +14,4 @@ task test, "Run the deterministic local test suite (excludes live-API drivers)":
   #   GLM_API_KEY=... nim c -r tests/test_sse_correctness.nim
   # Keep the list explicit (no `tests/*.nim` glob) so adding a new live-API
   # test by mistake can't quietly break CI.
-  exec "sh -c 'set -e; for t in tests/test_streamhttp.nim tests/test_handshake_timeout.nim tests/test_send_dead_tls.nim; do nim c -r \"$t\"; done'"
+  exec "sh -c 'set -e; for t in tests/test_streamhttp.nim tests/test_handshake_timeout.nim tests/test_send_dead_tls.nim tests/test_connect_interrupt.nim; do nim c -r \"$t\"; done'"

@@ -399,6 +399,18 @@ proc readHeadLine(c: StreamConn): string =
 
 # ---------- Public API ----------
 
+var onConnectingFd*: proc(fd: SocketHandle) {.gcsafe, closure.}
+  ## Hook fired with the raw socket fd right after it is created and before
+  ## the blocking TCP connect (and, for TLS, the handshake). Lets a caller
+  ## that owns cancellation (e.g. a SIGINT / quiet-watch path) publish the
+  ## fd so it can `shutdown(fd)` it from another thread and wake the connect
+  ## the moment an interrupt is requested. Without this the connect phase is
+  ## uninterruptible: the fd is unknown to the caller until `connectTls`/
+  ## `connectPlain` returns, so there is nothing to shut down, and a
+  ## black-holed or slow remote pins the caller for the full connect budget.
+  ## Set to `nil` to disable (the default). Fire-and-forget: the callback
+  ## receives the fd but must not close it; the caller only `shutdown`s it.
+
 proc newStreamConn*(sock: Socket; ctx: SslContext = nil): StreamConn =
   ## Wrap an already-connected (and TLS-handshaken if applicable) socket.
   ## Pass `ctx` so it stays alive as long as the connection — destroying
@@ -577,6 +589,11 @@ proc connectTls*(host: string; port: Port = Port(443);
   # no timeout - the hole we are closing. By connecting plain and wrapping
   # after, the bounded handshake below is the only `SSL_connect` on the path.
   var sock = newSocket(buffered = false)
+  # Publish the fd before the blocking connect so a caller's cancellation
+  # path can `shutdown()` it and wake the connect; the fd is otherwise unknown
+  # until this proc returns. `net.connect`'s internal poll then returns
+  # immediately with ECONNRESET (shutdown on a connecting fd surfaces that).
+  if onConnectingFd != nil: onConnectingFd(sock.getFd)
   let startMs = int(epochTime() * 1000)
   sock.connect(ip, port, timeout = timeoutMs)
   ctx.wrapSocket(sock)
@@ -597,6 +614,7 @@ proc connectPlain*(host: string; port: Port;
   ## `host` once via `getAddrInfo` (cached per process) and connects to the IP.
   let ip = resolveCached(host, port)
   var sock = newSocket(buffered = false)
+  if onConnectingFd != nil: onConnectingFd(sock.getFd)
   sock.connect(ip, port, timeout = timeoutMs)
   newStreamConn(sock)
 

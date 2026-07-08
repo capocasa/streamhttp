@@ -4,3 +4,4 @@
 # sneak in over time.
 tests/test_*
 !tests/test_*.nim
+src/streamhttp

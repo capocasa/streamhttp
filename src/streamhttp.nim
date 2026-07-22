@@ -196,6 +196,23 @@ template sdbg*(msg: string) =
   when streamDebug:
     stderr.writeLine("[sdbg] " & msg)
 
+proc applySendTimeout*(sock: Socket; timeoutMs: int) =
+  ## Set `SO_SNDTIMEO` on the underlying socket fd so a blocking `send()`
+  ## (and, on TLS, the `SSL_write` it drives) is woken by the kernel after
+  ## `timeoutMs` of no progress. Without this, a black-holed link mid-upload
+  ## blocks `send()` in TCP retransmission for the full kernel budget (~15min
+  ## on Linux, `tcp_retries2=15`); `shutdown(fd)` from a cancellation thread
+  ## does not wake it because the FIN cannot leave either. `SO_SNDTIMEO` is
+  ## the only kernel mechanism that bounds a blocked write. A no-op on
+  ## Windows (no TLS transport there). Mirrors `applyRecvTimeout`.
+  if timeoutMs <= 0: return
+  when defined(posix) and not defined(windows):
+    var tv: Timeval
+    tv.tv_sec = Time(timeoutMs div 1000)
+    tv.tv_usec = Suseconds((timeoutMs mod 1000) * 1000)
+    discard setsockopt(sock.getFd, SOL_SOCKET, SO_SNDTIMEO,
+                       addr(tv), sizeof(tv).SockLen)
+
 proc applyRecvTimeout*(sock: Socket; timeoutMs: int) =
   ## Set `SO_RCVTIMEO` on the underlying socket fd so a blocking `recv` (and,
   ## on TLS, the `SSL_read` it drives) is woken by the kernel after
@@ -219,10 +236,15 @@ proc applyRecvTimeout*(sock: Socket; timeoutMs: int) =
 
 proc setReadTimeoutMs*(c: StreamConn; timeoutMs: int) =
   ## Assign `readTimeoutMs` and mirror it onto the kernel socket as
-  ## `SO_RCVTIMEO`. This is the only correct way to change the per-read
-  ## deadline after construction.
+  ## `SO_RCVTIMEO`, and set `SO_SNDTIMEO` to the same value. This is the
+  ## only correct way to change the per-read deadline after construction.
+  ## The send timeout is set in lockstep: a request upload (`sendRequest`)
+  ## on a link that just went black-holed mid-stream blocks `send()` with no
+  ## kernel bound otherwise (see `applySendTimeout`), so the caller's quiet
+  ## shutdown wakes the recv loop but never the wedged write.
   c.readTimeoutMs = timeoutMs
   applyRecvTimeout(c.sock, timeoutMs)
+  applySendTimeout(c.sock, timeoutMs)
 
 # ---------- Correct TLS read path ----------
 #

@@ -791,29 +791,22 @@ proc getFd*(c: StreamConn): SocketHandle =
   else: c.sock.getFd
 
 proc close*(c: StreamConn) =
-  ## Close the underlying socket. Idempotent.
+  ## Close the connection. Idempotent, non-blocking, safe from any thread.
   ##
-  ## The graceful path runs a bidirectional TLS `close_notify` handshake
-  ## (`net.Socket.close` with `SafeDisconn`); against a black-holed peer
-  ## that second leg never arrives, so the call blocks in `SSL_shutdown`
-  ## (and, under the stdlib's `blockSigpipe`, in `sigwait` for a SIGPIPE
-  ## that never comes). Use `abruptClose` from an interrupt/quiet-teardown
-  ## path where the connection is already dead and must not pin the caller.
-  if not c.closed:
-    c.closed = true
-    try: c.sock.close() except CatchableError: discard
-
-proc abruptClose*(c: StreamConn) =
-  ## Abandon the connection WITHOUT a graceful TLS `close_notify` handshake.
-  ## `net.Socket.close` runs a bidirectional `SSL_shutdown` whose second leg
-  ## blocks forever against a black-holed peer (and, under the stdlib's
-  ## `blockSigpipe`, also blocks in `sigwait` for a SIGPIPE that never
-  ## arrives) - exactly the hang threecode hit on flaky links. So we never
-  ## call `net.Socket.close` here: we set `SO_LINGER = 0` on the fd and close
-  ## it directly via `posix.close`, which cannot block on pending data and
-  ## skips the TLS close_notify entirely. Idempotent. Forcibly tearing down a
-  ## dead/black-holed socket is what we want when the user pressed Ctrl-C or
-  ## the quiet-watch marked the link dead.
+  ## Never calls `net.Socket.close`: that runs a bidirectional TLS
+  ## `close_notify` via `SSL_shutdown`, whose second leg blocks forever
+  ## against a black-holed peer (and, under the stdlib's `blockSigpipe`,
+  ## also blocks in `sigwait` for a SIGPIPE that never arrives). That is the
+  ## exact wedge a leaked threecode network worker hit: a teardown close()
+  ## never returned, Ctrl-C could not cancel it, and the worker leaked for
+  ## the life of the process.
+  ##
+  ## Instead we skip the courtesy `close_notify` entirely. The TLS spec
+  ## permits tearing down without it; servers handle abrupt close routinely.
+  ## We free the OpenSSL handle (`SSL_free`) to avoid a leak, set
+  ## `SO_LINGER=0` so the kernel drops any pending send data instead of
+  ## lingering in TIME_WAIT, and close the fd directly via `posix.close`.
+  ## None of those steps can block.
   if not c.closed:
     c.closed = true
     when defined(posix) and not defined(windows):
@@ -824,8 +817,10 @@ proc abruptClose*(c: StreamConn) =
         ld.l_linger = 0.cint
         discard setsockopt(fd, SOL_SOCKET, SO_LINGER,
                            addr ld, SockLen(sizeof(ld)))
+      when defined(ssl):
+        if c.sock.isSsl and c.sock.sslHandle != nil:
+          SSL_free(c.sock.sslHandle)
+      if fd != osInvalidSocket:
         discard posix.close(fd)
-    # Close the socket object unconditionally so even on a platform without the
-    # posix path above (or if getFd already returned invalid) the connection
-    # is marked closed and not reused.
-    try: c.sock.close() except CatchableError: discard
+    else:
+      try: c.sock.close() except CatchableError: discard

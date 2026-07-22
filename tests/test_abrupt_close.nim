@@ -3,11 +3,12 @@
 ##
 ## Scenario: the server completes the TLS handshake (so a real StreamConn
 ## exists) but then never sends anything and never closes, mirroring a link
-## that died mid-response. A graceful `close()` runs a bidirectional TLS
+## that died mid-response. `net.Socket.close` runs a bidirectional TLS
 ## `close_notify` whose second leg blocks forever waiting for the peer's
 ## close_notify (and, under the stdlib's `blockSigpipe`, also blocks in
-## `sigwait` for a SIGPIPE that never arrives). `abruptClose` must instead
-## tear the fd down directly (SO_LINGER=0 + posix.close) and return bounded.
+## `sigwait` for a SIGPIPE that never arrives). `close` must instead free
+## the OpenSSL handle and tear the fd down directly (SO_LINGER=0 +
+## posix.close), never blocking.
 ##
 ## Before the fix threecode's network worker leaked a thread stuck in
 ## close()/sigwait for the life of the process; Ctrl-C/ESC could not cancel
@@ -52,8 +53,8 @@ proc blackHoleServer(a: BlackHoleArgs) {.thread, gcsafe.} =
     except CatchableError: discard
     try: a.listener.close() except CatchableError: discard
 
-suite "abruptClose does not block on a black-holed TLS peer":
-  test "abruptClose returns bounded where graceful close would hang":
+suite "close does not block on a black-holed TLS peer":
+  test "close returns bounded where graceful close would hang":
     if not ensureCert():
       check true  # openssl absent; skip
     else:
@@ -75,8 +76,8 @@ suite "abruptClose does not block on a black-holed TLS peer":
 
       # The peer has black-holed: a graceful close() would block in
       # SSL_shutdown waiting for the peer's close_notify (and in sigwait).
-      # abruptClose must tear down within a small bound.
+      # close must tear down within a small bound.
       let fromClose = epochTime()
-      c.abruptClose()
+      c.close()
       let elapsed = epochTime() - fromClose
       check elapsed < 2.0

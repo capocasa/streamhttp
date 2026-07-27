@@ -815,6 +815,17 @@ proc getFd*(c: StreamConn): SocketHandle =
 proc close*(c: StreamConn) =
   ## Close the connection. Idempotent, non-blocking, safe from any thread.
   ##
+  ## ORDERING REQUIREMENT: `close` frees the OpenSSL handle and closes
+  ## the fd immediately. A concurrent `recv`/`readResponseHead`/`readLine`
+  ## on the same `StreamConn` is then use-after-free territory — the read
+  ## side may touch the freed SSL handle or get EBADF on a recycled fd.
+  ## Before closing a connection another thread might be reading, first
+  ## `posix.shutdown(c.getFd, SHUT_RDWR)` so the blocking `recv` returns,
+  ## let the reader observe its interrupt condition and unwind out of the
+  ## read path, and only then call `close`. Callers that own the conn
+  ## single-threaded (sequential request/response, or `defer: c.close()`
+  ## in the only thread that ever touches it) need no shutdown.
+  ##
   ## Never calls `net.Socket.close`: that runs a bidirectional TLS
   ## `close_notify` via `SSL_shutdown`, whose second leg blocks forever
   ## against a black-holed peer (and, under the stdlib's `blockSigpipe`,

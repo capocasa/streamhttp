@@ -77,6 +77,39 @@ Three encodings supported:
 - `beIdentity` with `contentLength < 0` — read until socket close (HTTP/1.0 style); call `markEof` when the socket closes
 - `beChunked` — `Transfer-Encoding: chunked` per RFC 7230, ignoring chunk extensions and discarding trailer headers
 
+## Closing a connection
+
+`close` never blocks: it skips the TLS `close_notify`, frees the
+OpenSSL handle, sets `SO_LINGER=0`, and closes the fd directly. It is
+idempotent and may be called from any thread.
+
+One ordering rule is load-bearing: `close` frees the SSL handle and fd
+immediately, so a concurrent in-flight `recv` on the same `StreamConn`
+is use-after-free territory. If another thread might be blocked in
+`readResponseHead`/`readLine`/`lines`, first interrupt the read:
+
+```nim
+discard posix.shutdown(c.getFd, SHUT_RDWR)  # reader's recv returns
+# reader observes its cancel condition and unwinds out of the read path
+c.close()
+```
+
+If the conn is only ever touched by one thread (the common
+case, including `defer: c.close()`), no shutdown is needed.
+
+## DNS
+
+`getAddrInfo` has no timeout, so each host is resolved once per
+process and the first usable IP is cached; connects then go by IP
+(SNI and cert validation still use the original hostname). Call
+`invalidateResolved(host, port)` after a connect failure so a stale
+record pointing at a dead host is re-resolved on the next attempt.
+
+The single first resolve per host is still unbounded (the libc
+resolver can hang on a black-holed DNS path). That is the documented
+floor; bounding it needs a resolver thread or c-ares, deliberately out
+of scope here.
+
 ## Scope
 
 What's in: HTTP/1.1, TLS via `std/net`, sized + chunked + until-close

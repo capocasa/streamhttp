@@ -469,6 +469,27 @@ var
   resolveCache {.guard: resolveLock.}: Table[string, string]
 resolveLock.initLock()
 
+when defined(ssl):
+  # One verifying SSL_CTX per process (per caFile, which is a constant per
+  # binary). `SslContext` has no `=destroy`, so a fresh `newContext` per
+  # connection leaks the ctx plus the parsed CA trust store (~0.8 MB) in
+  # the C heap on every TLS connect. The raw handle is shared; every
+  # caller gets its own thin `SslContext` ref so no Nim refcount crosses
+  # threads. OpenSSL contexts are thread-safe once constructed.
+  var
+    tlsLock: Lock
+    tlsHandles {.guard: tlsLock.}: Table[string, SslCtx]
+  tlsLock.initLock()
+
+  proc cachedTlsContext(caFile: string): SslContext =
+    withLock(tlsLock):
+      if not tlsHandles.hasKey(caFile):
+        tlsHandles[caFile] =
+            newContext(verifyMode = CVerifyPeer,
+                       caFile = caFile).context
+      result = new SslContext
+      result.context = tlsHandles[caFile]
+
 template resolveKey(host: string; port: Port): string =
   host & ":" & $port.uint16
 
@@ -604,7 +625,7 @@ proc connectTls*(host: string; port: Port = Port(443);
   ## handshake; either exceeding it raises `HandshakeTimeoutError`
   ## (a `StreamTimeoutError` subtype).
   let ip = resolveCached(host, port)
-  let ctx = newContext(verifyMode = CVerifyPeer, caFile = caFile)
+  let ctx = cachedTlsContext(caFile)
   # TCP connect on a plain socket first. We deliberately wrap SSL AFTER the
   # TCP connect: `net.connect(socket, ip, timeout)` runs a blocking
   # `SSL_connect` when the socket is already SSL-wrapped, and that call has

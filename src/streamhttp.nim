@@ -23,6 +23,8 @@ import std/locks
 # the regression that broke `nim c -r --os:windows` in 0.4.0.
 when defined(posix) and not defined(windows):
   import std/posix except SocketHandle
+when defined(windows):
+  import std/winlean
 when defined(ssl):
   import std/openssl
 
@@ -203,8 +205,8 @@ proc applySendTimeout*(sock: Socket; timeoutMs: int) =
   ## blocks `send()` in TCP retransmission for the full kernel budget (~15min
   ## on Linux, `tcp_retries2=15`); `shutdown(fd)` from a cancellation thread
   ## does not wake it because the FIN cannot leave either. `SO_SNDTIMEO` is
-  ## the only kernel mechanism that bounds a blocked write. A no-op on
-  ## Windows (no TLS transport there). Mirrors `applyRecvTimeout`.
+  ## the only kernel mechanism that bounds a blocked write. Mirrors
+  ## `applyRecvTimeout`.
   if timeoutMs <= 0: return
   when defined(posix) and not defined(windows):
     var tv: Timeval
@@ -212,6 +214,11 @@ proc applySendTimeout*(sock: Socket; timeoutMs: int) =
     tv.tv_usec = Suseconds((timeoutMs mod 1000) * 1000)
     discard setsockopt(sock.getFd, SOL_SOCKET, SO_SNDTIMEO,
                        addr(tv), sizeof(tv).SockLen)
+  else:
+    # Winsock takes a DWORD timeout in milliseconds, not a timeval.
+    var ms: int32 = timeoutMs.int32
+    discard setsockopt(sock.getFd, SOL_SOCKET, 0x1005'i32,
+                       addr(ms), SockLen(4))
 
 proc applyRecvTimeout*(sock: Socket; timeoutMs: int) =
   ## Set `SO_RCVTIMEO` on the underlying socket fd so a blocking `recv` (and,
@@ -224,8 +231,7 @@ proc applyRecvTimeout*(sock: Socket; timeoutMs: int) =
   ## so the bounded `poll` step returns but the unbounded `SSL_read` after it
   ## stalls. `SO_RCVTIMEO` makes the kernel interrupt the stall and surface
   ## `EAGAIN`, which `net.recv` raises as `OSError`; `recvChunk` translates
-  ## that to `StreamTimeoutError` so the caller's wake loop fires. A no-op
-  ## (and safe) on Windows, which we don't ship TLS on.
+  ## that to `StreamTimeoutError` so the caller's wake loop fires.
   if timeoutMs <= 0: return
   when defined(posix) and not defined(windows):
     var tv: Timeval
@@ -233,6 +239,15 @@ proc applyRecvTimeout*(sock: Socket; timeoutMs: int) =
     tv.tv_usec = Suseconds((timeoutMs mod 1000) * 1000)
     discard setsockopt(sock.getFd, SOL_SOCKET, SO_RCVTIMEO,
                        addr(tv), sizeof(tv).SockLen)
+  else:
+    # Winsock SO_RCVTIMEO takes a DWORD in milliseconds. Without it the
+    # `SSL_read` that follows a readable `selectRead` can block forever
+    # (the same poll-vs-TLS-record race as POSIX), so a black-holed
+    # provider link parks the stream loop with no timeout and no
+    # interrupt wake.
+    var ms: int32 = timeoutMs.int32
+    discard setsockopt(sock.getFd, SOL_SOCKET, 0x1006'i32,
+                       addr(ms), SockLen(4))
 
 proc setReadTimeoutMs*(c: StreamConn; timeoutMs: int) =
   ## Assign `readTimeoutMs` and mirror it onto the kernel socket as
@@ -341,6 +356,9 @@ proc doRecv(c: StreamConn): string =
     # re-raises here so the caller surfaces it as a hard error.
     when defined(posix) and not defined(windows):
       if e.errorCode == EAGAIN.int32 or e.errorCode == EWOULDBLOCK.int32:
+        raise newException(StreamTimeoutError, "recv timed out (SO_RCVTIMEO)")
+    else:
+      if e.errorCode == WSAETIMEDOUT.int32:
         raise newException(StreamTimeoutError, "recv timed out (SO_RCVTIMEO)")
     raise e
   except CatchableError as e:

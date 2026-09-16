@@ -490,3 +490,39 @@ suite "StreamConn bounded-read timeout":
     except StreamTimeoutError:
       raised = true
     check raised
+
+suite "connect failure classification":
+  # A connect-phase failure (DNS, refused, unreachable) must surface as
+  # `StreamConnectError`, not as a TLS error: callers use the distinction
+  # to report "host not there" instead of blaming TLS. Before `connectTcp`
+  # existed both phases raised the same bare OSError from `connectTls`, so
+  # a dead host masqueraded as a TLS problem.
+  test "refused port raises StreamConnectError from connectTls and connectPlain":
+    # Bind, read the port, close: connecting to it now is an immediate
+    # ECONNREFUSED rather than a timeout.
+    let probe = newSocket(buffered = false)
+    probe.setSockOpt(OptReuseAddr, true)
+    probe.bindAddr(Port(0), "127.0.0.1")
+    probe.listen()
+    let port = probe.getLocalAddr()[1]
+    probe.close()
+    for tls in [true, false]:
+      var raised = false
+      try:
+        let c = if tls: connectTls("127.0.0.1", port, timeoutMs = 3_000)
+                else: connectPlain("127.0.0.1", port, timeoutMs = 3_000)
+        c.close()
+      except StreamConnectError as e:
+        raised = true
+        check "refused" in e.msg.toLowerAscii
+      check raised
+
+  test "unresolvable host raises StreamConnectError":
+    # `.invalid` is reserved by RFC 2606 to never resolve.
+    var raised = false
+    try:
+      discard connectTls("no.such.host.invalid", Port(443), timeoutMs = 3_000)
+    except StreamConnectError as e:
+      raised = true
+      check e.msg.len > 0
+    check raised

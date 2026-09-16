@@ -84,6 +84,12 @@ type
     ## complete within the connect deadline. A subtype of `StreamTimeoutError`
     ## so the recv loop's existing `except StreamTimeoutError` recovery in the
     ## caller treats a handshake stall uniformly with a recv stall.
+  StreamConnectError* = object of CatchableError
+    ## Raised by `connectTcp` (the shared first step of `connectTls` and
+    ## `connectPlain`) when DNS resolution or the TCP connect fails: host
+    ## unknown, refused, unreachable, timed out. Distinct from the TLS
+    ## handshake/certificate errors `connectTls` raises afterwards so callers
+    ## can report "the host is not there" instead of blaming TLS.
 
 proc initBodyDecoder*(encoding: BodyEncoding;
                       contentLength: int = -1): BodyDecoder =
@@ -623,6 +629,29 @@ when defined(ssl):
       if match != 1:
         raiseSSLError("SSL Certificate check failed.")
 
+proc connectTcp*(host: string; port: Port; timeoutMs: int): Socket =
+  ## Shared first step of `connectTls` and `connectPlain`: resolve `host`
+  ## (cached per process) and open the TCP connection. Raises
+  ## `StreamConnectError` when resolution or the connect fails, so callers
+  ## can tell an unreachable host apart from a TLS handshake failure.
+  ##
+  ## The fd is published via `onConnectingFd` before the blocking connect so
+  ## a caller's cancellation path can `shutdown()` it and wake the connect;
+  ## the fd is otherwise unknown until this proc returns. `net.connect`'s
+  ## internal poll then returns immediately with ECONNRESET (shutdown on a
+  ## connecting fd surfaces that).
+  var ip = ""
+  try:
+    ip = resolveCached(host, port)
+  except CatchableError as e:
+    raise newException(StreamConnectError, e.msg)
+  result = newSocket(buffered = false)
+  if onConnectingFd != nil: onConnectingFd(result.getFd)
+  try:
+    result.connect(ip, port, timeout = timeoutMs)
+  except CatchableError as e:
+    raise newException(StreamConnectError, e.msg)
+
 proc connectTls*(host: string; port: Port = Port(443);
                  timeoutMs: int = 20_000;
                  caFile: string = ""): StreamConn =
@@ -639,24 +668,19 @@ proc connectTls*(host: string; port: Port = Port(443);
   ## DNS: resolves `host` once via `getAddrInfo` (cached per process) and
   ## connects to the IP, so the libc resolver only runs on the first call per
   ## host, not on every connect. SNI and cert validation still use `host`.
+  ## A resolution or TCP-connect failure raises `StreamConnectError`.
   ## `timeoutMs` is a single budget shared by the TCP connect and the TLS
   ## handshake; either exceeding it raises `HandshakeTimeoutError`
   ## (a `StreamTimeoutError` subtype).
-  let ip = resolveCached(host, port)
   let ctx = cachedTlsContext(caFile)
-  # TCP connect on a plain socket first. We deliberately wrap SSL AFTER the
-  # TCP connect: `net.connect(socket, ip, timeout)` runs a blocking
-  # `SSL_connect` when the socket is already SSL-wrapped, and that call has
-  # no timeout - the hole we are closing. By connecting plain and wrapping
-  # after, the bounded handshake below is the only `SSL_connect` on the path.
-  var sock = newSocket(buffered = false)
-  # Publish the fd before the blocking connect so a caller's cancellation
-  # path can `shutdown()` it and wake the connect; the fd is otherwise unknown
-  # until this proc returns. `net.connect`'s internal poll then returns
-  # immediately with ECONNRESET (shutdown on a connecting fd surfaces that).
-  if onConnectingFd != nil: onConnectingFd(sock.getFd)
+  # TCP connect on a plain socket first (`connectTcp`). We deliberately
+  # wrap SSL AFTER the TCP connect: `net.connect(socket, ip, timeout)` runs
+  # a blocking `SSL_connect` when the socket is already SSL-wrapped, and that
+  # call has no timeout - the hole we are closing. By connecting plain and
+  # wrapping after, the bounded handshake below is the only `SSL_connect` on
+  # the path.
   let startMs = int(epochTime() * 1000)
-  sock.connect(ip, port, timeout = timeoutMs)
+  var sock = connectTcp(host, port, timeoutMs)
   ctx.wrapSocket(sock)
   when defined(ssl):
     if not isIpAddress(host):
@@ -673,11 +697,8 @@ proc connectPlain*(host: string; port: Port;
   ## Open a plain (non-TLS) TCP connection. For testing against local
   ## servers, or http:// endpoints when you don't care about TLS. Resolves
   ## `host` once via `getAddrInfo` (cached per process) and connects to the IP.
-  let ip = resolveCached(host, port)
-  var sock = newSocket(buffered = false)
-  if onConnectingFd != nil: onConnectingFd(sock.getFd)
-  sock.connect(ip, port, timeout = timeoutMs)
-  newStreamConn(sock)
+  ## Raises `StreamConnectError` when resolution or the connect fails.
+  newStreamConn(connectTcp(host, port, timeoutMs))
 
 proc sslSendAll(sock: Socket; data: string) =
   ## Write all of `data` to a TLS socket, aborting on a dead connection
